@@ -2,6 +2,7 @@ import { getStore } from "@netlify/blobs";
 import { loadHolidaySet, shouldPollNow } from "../../src/calendar.js";
 import { loadConfig, validateConfig } from "../../src/config.js";
 import { filterUnnotified, markNotified } from "../../src/state.js";
+import { sendPushPlusMessage } from "../../src/pushplus.js";
 import { fetchRebalanceHistory, parseRebalanceRecords, XueqiuAuthError } from "../../src/xueqiu.js";
 import { sendWxPusherMessage } from "../../src/wxpusher.js";
 
@@ -54,7 +55,11 @@ async function checkWithBlobState({ config, holidaySet, store, fetchImpl = fetch
   const unnotified = filterUnnotified(records, state);
   for (const record of unnotified.reverse()) {
     for (const change of record.changes) {
-      await sendWxPusherMessage(config.wxpusher, change, fetchImpl);
+      if (config.pushplus?.token || config.pushplus?.dryRun) {
+        await sendPushPlusMessage(config.pushplus, change, fetchImpl);
+      } else {
+        await sendWxPusherMessage(config.wxpusher, change, fetchImpl);
+      }
     }
   }
 
