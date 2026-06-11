@@ -1,0 +1,17 @@
+{
+  "name": "xueqiu-cube-rebalance-wechat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Monitor Xueqiu cube rebalances and notify via WeChat official account template messages.",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^9.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

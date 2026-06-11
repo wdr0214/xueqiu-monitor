@@ -1,0 +1,10 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+  included_files = ["config/market-holidays.cn-a.json"]
+
+[functions."monitor"]
+  schedule = "* * * * *"

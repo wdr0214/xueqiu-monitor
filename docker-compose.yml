@@ -1,0 +1,12 @@
+services:
+  xueqiu-rebalance-monitor:
+    build: .
+    container_name: xueqiu-rebalance-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
