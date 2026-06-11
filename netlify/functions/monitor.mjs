@@ -4,6 +4,7 @@ import { loadConfig, validateConfig } from "../../src/config.js";
 import { filterUnnotified, markNotified } from "../../src/state.js";
 import { sendPushPlusMessage } from "../../src/pushplus.js";
 import { fetchRebalanceHistory, parseRebalanceRecords, XueqiuAuthError } from "../../src/xueqiu.js";
+import { sendTemplateMessage } from "../../src/wechat.js";
 import { sendWxPusherMessage } from "../../src/wxpusher.js";
 
 const EMPTY_STATE = {
@@ -55,7 +56,9 @@ async function checkWithBlobState({ config, holidaySet, store, fetchImpl = fetch
   const unnotified = filterUnnotified(records, state);
   for (const record of unnotified.reverse()) {
     for (const change of record.changes) {
-      if (config.pushplus?.token || config.pushplus?.dryRun) {
+      if (config.wechat?.appId && config.wechat?.appSecret && config.wechat?.toOpenId && config.wechat?.templateId) {
+        await sendTemplateMessage(config.wechat, change, fetchImpl);
+      } else if (config.pushplus?.token || config.pushplus?.dryRun) {
         await sendPushPlusMessage(config.pushplus, change, fetchImpl);
       } else {
         await sendWxPusherMessage(config.wxpusher, change, fetchImpl);
