@@ -57,6 +57,10 @@ export function loadConfig() {
       appToken: env("WXPUSHER_APP_TOKEN", ""),
       uid: env("WXPUSHER_UID", ""),
       dryRun: env("WXPUSHER_DRY_RUN", env("WECHAT_DRY_RUN", "false")).toLowerCase() === "true"
+    },
+    pushplus: {
+      token: env("PUSHPLUS_TOKEN", ""),
+      dryRun: env("PUSHPLUS_DRY_RUN", env("WECHAT_DRY_RUN", "false")).toLowerCase() === "true"
     }
   };
 }
@@ -66,6 +70,9 @@ export function validateConfig(config) {
   if (!fs.existsSync(config.holidayFile)) {
     throw new Error(`HOLIDAY_FILE does not exist: ${config.holidayFile}`);
   }
+
+  const hasPushPlus = Boolean(config.pushplus?.token);
+  if (hasPushPlus || config.pushplus?.dryRun) return;
 
   const hasWxPusher = Boolean(config.wxpusher?.appToken && config.wxpusher?.uid);
   if (hasWxPusher || config.wxpusher?.dryRun) return;
