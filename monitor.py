@@ -22,7 +22,6 @@ from zoneinfo import ZoneInfo
 
 XUEQIU_HISTORY_API = "https://xueqiu.com/cubes/rebalancing/history.json"
 XUEQIU_SHOW_API = "https://xueqiu.com/cubes/show.json"
-WXPUSHER_SEND_API = "https://wxpusher.zjiecode.com/api/send/message"
 WECHAT_TOKEN_API = "https://api.weixin.qq.com/cgi-bin/token"
 WECHAT_TEMPLATE_API = "https://api.weixin.qq.com/cgi-bin/message/template/send"
 COOKIE_JAR = http.cookiejar.CookieJar()
@@ -338,12 +337,11 @@ def main() -> int:
     changes = direct_changes or compare_holdings(history.get("holdings", {}), current_holdings)
     if changes:
         push_wechat(config, changes)
+        history["holdings"] = current_holdings or history.get("holdings", {})
+        history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-500:]
+        save_history(history)
     else:
         print(f"[{now_text()}] 未发现调仓")
-
-    history["holdings"] = current_holdings or history.get("holdings", {})
-    history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-500:]
-    save_history(history)
     return 0
 
 
