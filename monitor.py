@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor a public Xueqiu cube and push rebalance notices through WxPusher."""
+"""Monitor a public Xueqiu cube and push rebalance notices through WeChat."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo
 XUEQIU_HISTORY_API = "https://xueqiu.com/cubes/rebalancing/history.json"
 XUEQIU_SHOW_API = "https://xueqiu.com/cubes/show.json"
 WXPUSHER_SEND_API = "https://wxpusher.zjiecode.com/api/send/message"
+WECHAT_TOKEN_API = "https://api.weixin.qq.com/cgi-bin/token"
+WECHAT_TEMPLATE_API = "https://api.weixin.qq.com/cgi-bin/message/template/send"
 COOKIE_JAR = http.cookiejar.CookieJar()
 OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIE_JAR))
 
@@ -39,8 +41,10 @@ class MonitorError(Exception):
 @dataclass(frozen=True)
 class Config:
     xueqiu_url: str
-    wxpusher_app_token: str
-    wxpusher_uid: str
+    wechat_app_id: str
+    wechat_app_secret: str
+    wechat_to_openid: str
+    wechat_template_id: str
     xueqiu_cookie: str = ""
 
     @property
@@ -66,8 +70,10 @@ def required_env(name: str) -> str:
 def load_config() -> Config:
     return Config(
         xueqiu_url=required_env("XUEQIU_URL"),
-        wxpusher_app_token=required_env("WXPUSHER_APP_TOKEN"),
-        wxpusher_uid=required_env("WXPUSHER_UID"),
+        wechat_app_id=required_env("WECHAT_APP_ID"),
+        wechat_app_secret=required_env("WECHAT_APP_SECRET"),
+        wechat_to_openid=required_env("WECHAT_TO_OPENID"),
+        wechat_template_id=required_env("WECHAT_TEMPLATE_ID"),
         xueqiu_cookie=os.getenv("XUEQIU_COOKIE", "").strip(),
     )
 
@@ -265,20 +271,36 @@ def compare_holdings(old: dict[str, float], new: dict[str, float]) -> list[dict[
     return changes
 
 
-def push_wxpusher(config: Config, changes: list[dict[str, str]]) -> None:
-    lines = [f"雪球组合调仓提醒", f"时间：{now_text()}", ""]
+def fetch_wechat_access_token(config: Config) -> str:
+    params = urllib.parse.urlencode({
+        "grant_type": "client_credential",
+        "appid": config.wechat_app_id,
+        "secret": config.wechat_app_secret,
+    })
+    data = request_json(f"{WECHAT_TOKEN_API}?{params}")
+    token = data.get("access_token") if isinstance(data, dict) else None
+    if not token:
+        raise MonitorError(f"微信 access_token 获取失败：{data}")
+    return str(token)
+
+
+def push_wechat(config: Config, changes: list[dict[str, str]]) -> None:
+    token = fetch_wechat_access_token(config)
     for change in changes:
-        lines.append(f"{change['action']}｜{change['stock']}｜成交价格：{change['price']}")
-    content = "\n".join(lines)
-    body = {
-        "appToken": config.wxpusher_app_token,
-        "content": content,
-        "summary": "雪球组合调仓提醒",
-        "contentType": 1,
-        "uids": [config.wxpusher_uid],
-    }
-    result = request_json(WXPUSHER_SEND_API, method="POST", body=body)
-    print(f"[{now_text()}] WxPusher 推送结果：{result}")
+        body = {
+            "touser": config.wechat_to_openid,
+            "template_id": config.wechat_template_id,
+            "data": {
+                "stockName": {"value": change["stock"]},
+                "rebalanceChange": {"value": change["action"]},
+                "rebalancePrice": {"value": change["price"]},
+                "remark": {"value": f"雪球组合调仓监控自动推送｜{now_text()}"},
+            },
+        }
+        result = request_json(f"{WECHAT_TEMPLATE_API}?access_token={token}", method="POST", body=body)
+        if isinstance(result, dict) and result.get("errcode") not in (None, 0):
+            raise MonitorError(f"微信模板消息发送失败：{result}")
+        print(f"[{now_text()}] 微信测试号推送结果：{result}")
 
 
 def main() -> int:
@@ -315,7 +337,7 @@ def main() -> int:
 
     changes = direct_changes or compare_holdings(history.get("holdings", {}), current_holdings)
     if changes:
-        push_wxpusher(config, changes)
+        push_wechat(config, changes)
     else:
         print(f"[{now_text()}] 未发现调仓")
 
