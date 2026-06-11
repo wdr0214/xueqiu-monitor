@@ -20,7 +20,14 @@ function parseInteger(name, fallback) {
 
 function resolveProjectPath(value, fallback) {
   const target = value || fallback;
-  return path.isAbsolute(target) ? target : path.resolve(projectRoot, target);
+  if (path.isAbsolute(target)) return target;
+
+  const candidates = [
+    path.resolve(projectRoot, target),
+    path.resolve(process.cwd(), target),
+    path.resolve(projectRoot, "..", target)
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
 }
 
 export function loadConfig() {
