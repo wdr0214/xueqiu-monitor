@@ -1,0 +1,57 @@
+name: Xueqiu Cube Monitor
+
+on:
+  schedule:
+    - cron: "*/5 1-6 * * 1-5"
+    - cron: "0,5,10,15,20,25,30 7 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xueqiu-cube-monitor
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TZ: Asia/Shanghai
+      POLL_START: "09:00"
+      POLL_END: "15:30"
+      HISTORY_FILE: history.json
+      XUEQIU_URL: ${{ secrets.XUEQIU_URL }}
+      XUEQIU_COOKIE: ${{ secrets.XUEQIU_COOKIE }}
+      WECHAT_APP_ID: ${{ secrets.WECHAT_APP_ID }}
+      WECHAT_APP_SECRET: ${{ secrets.WECHAT_APP_SECRET }}
+      WECHAT_TO_OPENID: ${{ secrets.WECHAT_TO_OPENID }}
+      WECHAT_TEMPLATE_ID: ${{ secrets.WECHAT_TEMPLATE_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run monitor
+        run: python monitor.py
+
+      - name: Persist history
+        if: always()
+        run: |
+          if git diff --quiet -- history.json; then
+            echo "history.json unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.json
+          git commit -m "chore: update xueqiu monitor history"
+          git push
