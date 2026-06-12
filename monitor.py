@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:  # GitHub Actions installs this dependency.
+    curl_requests = None
+
 
 XUEQIU_HISTORY_API = "https://xueqiu.com/cubes/rebalancing/history.json"
 XUEQIU_SHOW_API = "https://xueqiu.com/cubes/show.json"
@@ -98,27 +103,47 @@ def in_trading_window() -> bool:
 
 
 def request_json(url: str, *, method: str = "GET", body: dict[str, Any] | None = None, cookie: str = "") -> Any:
-    payload = None
     headers = {
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 XueqiuCubeMonitor/1.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
         "Referer": "https://xueqiu.com/",
     }
     if cookie:
         headers["Cookie"] = cookie
-    if body is not None:
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
-    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
-    try:
-        with OPENER.open(req, timeout=20) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise MonitorError(f"网络请求失败 HTTP {exc.code}: {detail[:300]}") from exc
-    except urllib.error.URLError as exc:
-        raise MonitorError(f"网络请求异常：{exc.reason}") from exc
+    if curl_requests is not None:
+        try:
+            response = curl_requests.request(
+                method,
+                url,
+                headers=headers,
+                json=body,
+                timeout=20,
+                impersonate="chrome",
+            )
+            raw = response.text
+            if response.status_code >= 400:
+                raise MonitorError(f"网络请求失败 HTTP {response.status_code}: {raw[:300]}")
+        except MonitorError:
+            raise
+        except Exception as exc:
+            raise MonitorError(f"网络请求异常：{exc}") from exc
+    else:
+        payload = None
+        if body is not None:
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+        req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+        try:
+            with OPENER.open(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise MonitorError(f"网络请求失败 HTTP {exc.code}: {detail[:300]}") from exc
+        except urllib.error.URLError as exc:
+            raise MonitorError(f"网络请求异常：{exc.reason}") from exc
 
     try:
         data = json.loads(raw)
