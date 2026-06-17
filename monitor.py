@@ -36,6 +36,7 @@ HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "history.json"))
 TIMEZONE = ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))
 POLL_START = os.getenv("POLL_START", "09:00")
 POLL_END = os.getenv("POLL_END", "15:30")
+SEND_INITIAL_REBALANCE = os.getenv("SEND_INITIAL_REBALANCE", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 
 class MonitorError(Exception):
@@ -97,8 +98,6 @@ def parse_clock(value: str) -> dt_time:
 
 def in_trading_window() -> bool:
     now = datetime.now(TIMEZONE)
-    if now.weekday() >= 5:
-        return False
     return parse_clock(POLL_START) <= now.time() <= parse_clock(POLL_END)
 
 
@@ -342,6 +341,7 @@ def main() -> int:
     notified_ids = set(history.get("notified_rebalance_ids", []))
 
     direct_changes: list[dict[str, str]] = []
+    pending_records: list[tuple[str, list[dict[str, str]]]] = []
     new_record_ids: list[str] = []
     for index, record in enumerate(records):
         rid = record_id(record, index)
@@ -350,9 +350,18 @@ def main() -> int:
         changes = extract_changes_from_record(record)
         if changes:
             direct_changes.extend(changes)
+            pending_records.append((rid, changes))
             new_record_ids.append(rid)
 
     if not history.get("holdings") and not notified_ids:
+        if SEND_INITIAL_REBALANCE and pending_records:
+            latest_record_id, latest_changes = pending_records[0]
+            push_wechat(config, latest_changes)
+            history["holdings"] = current_holdings
+            history["notified_rebalance_ids"] = [latest_record_id]
+            save_history(history)
+            print(f"[{now_text()}] 首次运行，已推送最新调仓并建立基线")
+            return 0
         history["holdings"] = current_holdings
         history["notified_rebalance_ids"] = list(dict.fromkeys(new_record_ids or [record_id(r, i) for i, r in enumerate(records[:1])]))
         save_history(history)
