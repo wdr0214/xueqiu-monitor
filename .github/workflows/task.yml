@@ -2,8 +2,8 @@ name: Xueqiu Cube Monitor
 
 on:
   schedule:
-    - cron: "*/5 1-6 * * 1-5"
-    - cron: "0,5,10,15,20,25,30 7 * * 1-5"
+    - cron: "*/5 1-7 * * *"
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,8 +20,9 @@ jobs:
     env:
       TZ: Asia/Shanghai
       POLL_START: "09:00"
-      POLL_END: "15:30"
+      POLL_END: "16:00"
       HISTORY_FILE: history.json
+      SEND_INITIAL_REBALANCE: "true"
       XUEQIU_URL: ${{ secrets.XUEQIU_URL }}
       XUEQIU_COOKIE: ${{ secrets.XUEQIU_COOKIE }}
       WECHAT_APP_ID: ${{ secrets.WECHAT_APP_ID }}
