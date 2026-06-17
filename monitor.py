@@ -14,10 +14,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from curl_cffi import requests as curl_requests
@@ -33,7 +33,7 @@ COOKIE_JAR = http.cookiejar.CookieJar()
 OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIE_JAR))
 
 HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "history.json"))
-TIMEZONE = ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))
+TIMEZONE_NAME = os.getenv("TZ", "Asia/Shanghai")
 POLL_START = os.getenv("POLL_START", "09:00")
 POLL_END = os.getenv("POLL_END", "15:30")
 SEND_INITIAL_REBALANCE = os.getenv("SEND_INITIAL_REBALANCE", "false").strip().lower() in {"1", "true", "yes", "y"}
@@ -41,6 +41,19 @@ SEND_INITIAL_REBALANCE = os.getenv("SEND_INITIAL_REBALANCE", "false").strip().lo
 
 class MonitorError(Exception):
     pass
+
+
+def load_timezone(name: str):
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        if name in {"Asia/Shanghai", "Asia/Chongqing", "PRC", "UTC"}:
+            offset = 8 if name != "UTC" else 0
+            return timezone(timedelta(hours=offset), name)
+        raise
+
+
+TIMEZONE = load_timezone(TIMEZONE_NAME)
 
 
 @dataclass(frozen=True)
