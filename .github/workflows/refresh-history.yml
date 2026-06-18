@@ -1,0 +1,130 @@
+name: Refresh Xueqiu History
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/refresh-history.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TZ: Asia/Shanghai
+      XUEQIU_URL: ${{ secrets.XUEQIU_URL }}
+      XUEQIU_COOKIE: ${{ secrets.XUEQIU_COOKIE }}
+      HISTORY_FILE: history.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch latest Xueqiu data and update history
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          from curl_cffi import requests
+
+          xueqiu_url = os.environ.get("XUEQIU_URL", "")
+          cookie = os.environ.get("XUEQIU_COOKIE", "")
+          history_file = Path(os.environ.get("HISTORY_FILE", "history.json"))
+          tz = ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
+          symbol = xueqiu_url.rstrip('/').split('/')[-1] if xueqiu_url else "ZH188094"
+          headers = {
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Content-Type": "application/json",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+              "Referer": "https://xueqiu.com/",
+          }
+          if cookie:
+              headers["Cookie"] = cookie
+
+          def get_json(url):
+              resp = requests.get(url, headers=headers, timeout=20, impersonate="chrome")
+              print(f"GET {url.split('?')[0]} status={resp.status_code}")
+              if resp.status_code >= 400:
+                  print(resp.text[:500])
+                  raise SystemExit(1)
+              data = resp.json()
+              if isinstance(data, dict) and data.get("error_code"):
+                  print(json.dumps(data, ensure_ascii=False)[:800])
+                  raise SystemExit(1)
+              return data
+
+          def pick(mapping, *names):
+              for name in names:
+                  value = mapping.get(name)
+                  if value not in (None, ""):
+                      return value
+              return None
+
+          def record_id(record, index):
+              for key in ("id", "rebalancing_id", "updated_at", "created_at", "created"):
+                  value = record.get(key)
+                  if value not in (None, ""):
+                      return str(value)
+              return f"record-{index}-{json.dumps(record, ensure_ascii=False, sort_keys=True)[:80]}"
+
+          history_params = urllib.parse.urlencode({"cube_symbol": symbol, "count": 20, "page": 1})
+          show_params = urllib.parse.urlencode({"symbol": symbol})
+          history_data = get_json(f"https://xueqiu.com/cubes/rebalancing/history.json?{history_params}")
+          show_data = get_json(f"https://xueqiu.com/cubes/show.json?{show_params}")
+
+          records = history_data.get("list") or history_data.get("data", {}).get("list") or history_data.get("rebalancing_histories") or []
+          view = show_data.get("view_rebalancing") or {}
+          items = view.get("holdings") or (show_data.get("cube") or {}).get("holdings") or show_data.get("holdings") or []
+
+          holdings = {}
+          for item in items if isinstance(items, list) else []:
+              name = pick(item, "stock_name", "stockName", "name", "stock_symbol", "symbol")
+              weight = pick(item, "weight", "target_weight", "targetWeight", "proactive_weight")
+              if name is None or weight in (None, ""):
+                  continue
+              holdings[str(name)] = round(float(weight), 4)
+
+          record_ids = [record_id(record, idx) for idx, record in enumerate(records[:20])]
+          output = {
+              "holdings": holdings,
+              "notified_rebalance_ids": list(dict.fromkeys(record_ids))[-500:],
+              "updated_at": datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S"),
+          }
+          history_file.write_text(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"cube_symbol={symbol}")
+          print(f"holdings={len(holdings)}")
+          for name, weight in holdings.items():
+              print(f"  * {name}: {weight}")
+          print(f"notified_rebalance_ids={len(output['notified_rebalance_ids'])}")
+          print(f"latest_rebalance_id={record_ids[0] if record_ids else 'none'}")
+          PY
+
+      - name: Commit history
+        run: |
+          if git diff --quiet -- history.json; then
+            echo "history.json unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.json
+          git commit -m "chore: refresh xueqiu monitor history"
+          git push
