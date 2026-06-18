@@ -1,0 +1,96 @@
+name: Verify Xueqiu Data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TZ: Asia/Shanghai
+      XUEQIU_URL: ${{ secrets.XUEQIU_URL }}
+      XUEQIU_COOKIE: ${{ secrets.XUEQIU_COOKIE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Read Xueqiu data only
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          from datetime import datetime, timezone, timedelta
+          from curl_cffi import requests
+
+          xueqiu_url = os.environ.get("XUEQIU_URL", "")
+          cookie = os.environ.get("XUEQIU_COOKIE", "")
+          symbol = xueqiu_url.rstrip('/').split('/')[-1] if xueqiu_url else "ZH188094"
+          headers = {
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Content-Type": "application/json",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+              "Referer": "https://xueqiu.com/",
+          }
+          if cookie:
+              headers["Cookie"] = cookie
+
+          def get_json(url):
+              resp = requests.get(url, headers=headers, timeout=20, impersonate="chrome")
+              print(f"GET {url.split('?')[0]} status={resp.status_code}")
+              if resp.status_code >= 400:
+                  print(resp.text[:500])
+                  raise SystemExit(1)
+              data = resp.json()
+              if isinstance(data, dict) and data.get("error_code"):
+                  print(json.dumps(data, ensure_ascii=False)[:800])
+                  raise SystemExit(1)
+              return data
+
+          history_params = urllib.parse.urlencode({"cube_symbol": symbol, "count": 5, "page": 1})
+          show_params = urllib.parse.urlencode({"symbol": symbol})
+          history = get_json(f"https://xueqiu.com/cubes/rebalancing/history.json?{history_params}")
+          show = get_json(f"https://xueqiu.com/cubes/show.json?{show_params}")
+
+          records = history.get("list") or history.get("data", {}).get("list") or history.get("rebalancing_histories") or []
+          view = show.get("view_rebalancing") or {}
+          holdings = view.get("holdings") or (show.get("cube") or {}).get("holdings") or show.get("holdings") or []
+
+          print(f"cube_symbol={symbol}")
+          print(f"rebalance_records={len(records)}")
+          for idx, record in enumerate(records[:5], 1):
+              rid = record.get("id") or record.get("rebalancing_id") or record.get("updated_at") or record.get("created_at")
+              created = record.get("created_at") or record.get("updated_at")
+              if isinstance(created, (int, float)):
+                  if created > 10**12:
+                      created = created / 1000
+                  created_text = datetime.fromtimestamp(created, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+              else:
+                  created_text = str(created)
+              print(f"record#{idx} id={rid} time={created_text}")
+              items = record.get("rebalancing_histories") or record.get("histories") or record.get("stocks") or [record]
+              for item in items[:10]:
+                  name = item.get("stock_name") or item.get("name") or item.get("stock_symbol")
+                  symbol2 = item.get("stock_symbol") or item.get("symbol") or ""
+                  prev = item.get("prev_weight") or item.get("prev_target_weight")
+                  target = item.get("target_weight") or item.get("weight")
+                  price = item.get("price") or item.get("rebalanced_price") or item.get("trade_price")
+                  print(f"  - {name} {symbol2}: {prev} -> {target}, price={price}")
+
+          print(f"holdings={len(holdings)}")
+          for item in holdings[:20]:
+              name = item.get("stock_name") or item.get("name") or item.get("stock_symbol")
+              weight = item.get("weight") or item.get("target_weight")
+              print(f"  * {name}: {weight}")
+          PY
