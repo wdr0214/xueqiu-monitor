@@ -46,6 +46,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Print trigger context
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+          TRIGGER_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          echo "trigger_event=${TRIGGER_EVENT}"
+          if [ -n "${TRIGGER_SCHEDULE}" ]; then
+            echo "trigger_schedule=${TRIGGER_SCHEDULE}"
+          else
+            echo "trigger_schedule=workflow_dispatch_or_api"
+          fi
+
       - name: Run monitor
         run: python monitor.py
 
