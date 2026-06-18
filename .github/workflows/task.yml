@@ -2,8 +2,10 @@ name: Xueqiu Cube Monitor
 
 on:
   schedule:
-    - cron: "*/5 1-7 * * *"
-    - cron: "0 8 * * *"
+    - cron: "1/5 9-15 * * *"
+      timezone: "Asia/Shanghai"
+    - cron: "0 16 * * *"
+      timezone: "Asia/Shanghai"
   workflow_dispatch:
 
 permissions:
