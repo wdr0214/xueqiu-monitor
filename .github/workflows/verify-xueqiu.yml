@@ -2,6 +2,9 @@ name: Verify Xueqiu Data
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/verify-xueqiu.yml"
 
 jobs:
   verify:
