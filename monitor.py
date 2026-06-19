@@ -38,6 +38,7 @@ POLL_START = os.getenv("POLL_START", "09:00")
 POLL_END = os.getenv("POLL_END", "15:30")
 SEND_INITIAL_REBALANCE = os.getenv("SEND_INITIAL_REBALANCE", "false").strip().lower() in {"1", "true", "yes", "y"}
 XUEQIU_RETRY_SECONDS = int(os.getenv("XUEQIU_RETRY_SECONDS", "120"))
+MAX_NOTIFIED_REBALANCE_IDS = int(os.getenv("MAX_NOTIFIED_REBALANCE_IDS", "30"))
 
 
 class MonitorError(Exception):
@@ -266,6 +267,7 @@ def load_history() -> dict[str, Any]:
 
 
 def save_history(history: dict[str, Any]) -> None:
+    history["notified_rebalance_ids"] = list(dict.fromkeys(history.get("notified_rebalance_ids", [])))[-MAX_NOTIFIED_REBALANCE_IDS:]
     history["updated_at"] = now_text()
     tmp = HISTORY_FILE.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
@@ -405,7 +407,7 @@ def main() -> int:
             print(f"[{now_text()}] 首次运行，已推送最新调仓并建立基线")
             return 0
         history["holdings"] = current_holdings
-        history["notified_rebalance_ids"] = list(dict.fromkeys(new_record_ids or [record_id(r, i) for i, r in enumerate(records[:1])]))
+        history["notified_rebalance_ids"] = list(dict.fromkeys(new_record_ids or [record_id(r, i) for i, r in enumerate(records[:1])]))[-MAX_NOTIFIED_REBALANCE_IDS:]
         save_history(history)
         print(f"[{now_text()}] 首次运行，已建立基线，不推送")
         return 0
@@ -419,7 +421,7 @@ def main() -> int:
         push_wechat(config, changes)
         if current_holdings:
             history["holdings"] = current_holdings
-        history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-500:]
+        history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
         save_history(history)
     else:
         print(f"[{now_text()}] 未发现调仓")
