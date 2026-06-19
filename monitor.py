@@ -27,6 +27,7 @@ except ImportError:  # GitHub Actions installs this dependency.
 
 XUEQIU_HISTORY_API = "https://xueqiu.com/cubes/rebalancing/history.json"
 XUEQIU_SHOW_API = "https://xueqiu.com/cubes/show.json"
+XUEQIU_ANALYZE_PAGE = "https://xueqiu.com/service/p/cube-analyze"
 WECHAT_TOKEN_API = "https://api.weixin.qq.com/cgi-bin/token"
 WECHAT_TEMPLATE_API = "https://api.weixin.qq.com/cgi-bin/message/template/send"
 COOKIE_JAR = http.cookiejar.CookieJar()
@@ -114,6 +115,38 @@ def parse_clock(value: str) -> dt_time:
 def in_trading_window() -> bool:
     now = datetime.now(TIMEZONE)
     return parse_clock(POLL_START) <= now.time() <= parse_clock(POLL_END)
+
+
+def request_text(url: str, *, cookie: str = "") -> str:
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Referer": "https://xueqiu.com/",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+
+    if curl_requests is not None:
+        try:
+            response = curl_requests.get(url, headers=headers, timeout=20, impersonate="chrome")
+            if response.status_code >= 400:
+                raise MonitorError(f"HTTP {response.status_code}: {response.text[:300]}")
+            return response.text
+        except MonitorError:
+            raise
+        except Exception as exc:
+            raise MonitorError(f"Text request failed: {exc}") from exc
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with OPENER.open(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise MonitorError(f"HTTP {exc.code}: {detail[:300]}") from exc
+    except urllib.error.URLError as exc:
+        raise MonitorError(f"Text request failed: {exc.reason}") from exc
 
 
 def request_json(url: str, *, method: str = "GET", body: dict[str, Any] | None = None, cookie: str = "") -> Any:
@@ -209,18 +242,14 @@ def fetch_holdings(config: Config) -> dict[str, float]:
     data = request_json(f"{XUEQIU_SHOW_API}?{params}", cookie=config.xueqiu_cookie)
     if not isinstance(data, dict):
         raise MonitorError("Xueqiu holdings response is not an object")
-    holdings: dict[str, float] = {}
-
-    view_rebalancing = data.get("view_rebalancing") if isinstance(data, dict) else None
-    items = None
-    if isinstance(view_rebalancing, dict):
-        items = view_rebalancing.get("holdings") or view_rebalancing.get("rebalancing_histories")
-    if items is None and isinstance(data, dict):
-        cube = data.get("cube") if isinstance(data.get("cube"), dict) else {}
-        items = cube.get("holdings") or data.get("holdings")
-
+    items = find_holding_items(data)
+    if items is None:
+        html = request_text(f"{XUEQIU_ANALYZE_PAGE}?{params}", cookie=config.xueqiu_cookie)
+        items = find_holding_items(extract_cube_info_from_html(html))
     if not isinstance(items, list):
         raise MonitorError("Xueqiu holdings list is missing or invalid")
+
+    holdings: dict[str, float] = {}
 
     for item in items:
         name = pick(item, "stock_name", "stockName", "name", "stock_symbol", "symbol")
@@ -232,6 +261,44 @@ def fetch_holdings(config: Config) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return holdings
+
+
+def find_holding_items(data: dict[str, Any]) -> list[dict[str, Any]] | None:
+    view_rebalancing = data.get("view_rebalancing")
+    if isinstance(view_rebalancing, dict):
+        items = view_rebalancing.get("holdings") or view_rebalancing.get("rebalancing_histories")
+        if isinstance(items, list):
+            return items
+
+    for key in ("last_rebalancing", "last_success_rebalancing"):
+        rebalancing = data.get(key)
+        if isinstance(rebalancing, dict) and isinstance(rebalancing.get("holdings"), list):
+            return rebalancing["holdings"]
+
+    cube = data.get("cube") if isinstance(data.get("cube"), dict) else None
+    if isinstance(cube, dict) and isinstance(cube.get("holdings"), list):
+        return cube["holdings"]
+
+    holdings = data.get("holdings")
+    return holdings if isinstance(holdings, list) else None
+
+
+def extract_cube_info_from_html(html: str) -> dict[str, Any]:
+    marker = "SNB.cubeInfo = "
+    start = html.find(marker)
+    if start < 0:
+        raise MonitorError("Xueqiu analyze page missing SNB.cubeInfo")
+    start += len(marker)
+    end = html.find(";</script>", start)
+    if end < 0:
+        raise MonitorError("Xueqiu analyze page cubeInfo terminator missing")
+    try:
+        data = json.loads(html[start:end])
+    except json.JSONDecodeError as exc:
+        raise MonitorError("Xueqiu analyze page cubeInfo is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise MonitorError("Xueqiu analyze page cubeInfo is not an object")
+    return data
 
 
 def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[str, float]]:
