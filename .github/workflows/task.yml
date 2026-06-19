@@ -2,10 +2,9 @@ name: Xueqiu Cube Monitor
 
 on:
   schedule:
-    - cron: "1/5 9-15 * * *"
-      timezone: "Asia/Shanghai"
-    - cron: "0 16 * * *"
-      timezone: "Asia/Shanghai"
+    # GitHub Actions cron uses UTC. These map to Asia/Shanghai 09:00-15:55 and 16:00.
+    - cron: "*/5 1-7 * * 1-5"
+    - cron: "0 8 * * 1-5"
   workflow_dispatch:
 
 permissions:
