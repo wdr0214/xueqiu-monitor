@@ -37,6 +37,7 @@ TIMEZONE_NAME = os.getenv("TZ", "Asia/Shanghai")
 POLL_START = os.getenv("POLL_START", "09:00")
 POLL_END = os.getenv("POLL_END", "15:30")
 SEND_INITIAL_REBALANCE = os.getenv("SEND_INITIAL_REBALANCE", "false").strip().lower() in {"1", "true", "yes", "y"}
+XUEQIU_RETRY_SECONDS = int(os.getenv("XUEQIU_RETRY_SECONDS", "120"))
 
 
 class MonitorError(Exception):
@@ -176,8 +177,12 @@ def random_delay() -> None:
 def fetch_rebalance_records(config: Config) -> list[dict[str, Any]]:
     params = urllib.parse.urlencode({"cube_symbol": config.cube_symbol, "count": 20, "page": 1})
     data = request_json(f"{XUEQIU_HISTORY_API}?{params}", cookie=config.xueqiu_cookie)
+    if not isinstance(data, dict):
+        raise MonitorError("Xueqiu rebalance response is not an object")
     records = data.get("list") or data.get("data", {}).get("list") or data.get("rebalancing_histories") or []
-    return records if isinstance(records, list) else []
+    if not isinstance(records, list):
+        raise MonitorError("Xueqiu rebalance list is missing or invalid")
+    return records
 
 
 def prime_xueqiu_session(config: Config) -> None:
@@ -201,17 +206,22 @@ def prime_xueqiu_session(config: Config) -> None:
 def fetch_holdings(config: Config) -> dict[str, float]:
     params = urllib.parse.urlencode({"symbol": config.cube_symbol})
     data = request_json(f"{XUEQIU_SHOW_API}?{params}", cookie=config.xueqiu_cookie)
+    if not isinstance(data, dict):
+        raise MonitorError("Xueqiu holdings response is not an object")
     holdings: dict[str, float] = {}
 
     view_rebalancing = data.get("view_rebalancing") if isinstance(data, dict) else None
-    items = []
+    items = None
     if isinstance(view_rebalancing, dict):
-        items = view_rebalancing.get("holdings") or view_rebalancing.get("rebalancing_histories") or []
-    if not items and isinstance(data, dict):
+        items = view_rebalancing.get("holdings") or view_rebalancing.get("rebalancing_histories")
+    if items is None and isinstance(data, dict):
         cube = data.get("cube") if isinstance(data.get("cube"), dict) else {}
-        items = cube.get("holdings") or data.get("holdings") or []
+        items = cube.get("holdings") or data.get("holdings")
 
-    for item in items if isinstance(items, list) else []:
+    if not isinstance(items, list):
+        raise MonitorError("Xueqiu holdings list is missing or invalid")
+
+    for item in items:
         name = pick(item, "stock_name", "stockName", "name", "stock_symbol", "symbol")
         weight = pick(item, "weight", "target_weight", "targetWeight", "proactive_weight")
         if name is None or weight in (None, ""):
@@ -221,6 +231,23 @@ def fetch_holdings(config: Config) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return holdings
+
+
+def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    last_error: MonitorError | None = None
+    for attempt in range(2):
+        try:
+            if attempt:
+                prime_xueqiu_session(config)
+            return fetch_rebalance_records(config), fetch_holdings(config)
+        except MonitorError as exc:
+            last_error = exc
+            if attempt == 0:
+                print(f"[{now_text()}] Xueqiu fetch failed: {exc}. Retry in {XUEQIU_RETRY_SECONDS}s.", file=sys.stderr)
+                time.sleep(XUEQIU_RETRY_SECONDS)
+                continue
+            break
+    raise MonitorError(f"Xueqiu fetch failed after retry; no notification sent: {last_error}")
 
 
 def pick(mapping: dict[str, Any], *names: str) -> Any:
@@ -349,8 +376,7 @@ def main() -> int:
     random_delay()
     prime_xueqiu_session(config)
 
-    records = fetch_rebalance_records(config)
-    current_holdings = fetch_holdings(config)
+    records, current_holdings = fetch_xueqiu_snapshot(config)
     notified_ids = set(history.get("notified_rebalance_ids", []))
 
     direct_changes: list[dict[str, str]] = []
@@ -367,6 +393,9 @@ def main() -> int:
             new_record_ids.append(rid)
 
     if not history.get("holdings") and not notified_ids:
+        if not current_holdings and not pending_records:
+            print(f"[{now_text()}] Empty holdings on initial run; skip baseline and notification.")
+            return 0
         if SEND_INITIAL_REBALANCE and pending_records:
             latest_record_id, latest_changes = pending_records[0]
             push_wechat(config, latest_changes)
@@ -381,10 +410,15 @@ def main() -> int:
         print(f"[{now_text()}] 首次运行，已建立基线，不推送")
         return 0
 
+    if not current_holdings and not direct_changes:
+        print(f"[{now_text()}] Empty holdings without direct rebalance changes; skip notification and history update.")
+        return 0
+
     changes = direct_changes or compare_holdings(history.get("holdings", {}), current_holdings)
     if changes:
         push_wechat(config, changes)
-        history["holdings"] = current_holdings or history.get("holdings", {})
+        if current_holdings:
+            history["holdings"] = current_holdings
         history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-500:]
         save_history(history)
     else:
