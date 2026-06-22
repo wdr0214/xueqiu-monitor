@@ -71,7 +71,7 @@ class Config:
 
     @property
     def cube_symbol(self) -> str:
-        match = re.search(r"/P/([A-Za-z0-9_]+)", self.xueqiu_url)
+        match = re.search(r"/p/([A-Za-z0-9_]+)", self.xueqiu_url, re.IGNORECASE)
         if match:
             return match.group(1)
         parsed = urllib.parse.urlparse(self.xueqiu_url)
@@ -89,15 +89,25 @@ def required_env(name: str) -> str:
     return value
 
 
-def load_config() -> Config:
-    return Config(
-        xueqiu_url=required_env("XUEQIU_URL"),
-        wechat_app_id=required_env("WECHAT_APP_ID"),
-        wechat_app_secret=required_env("WECHAT_APP_SECRET"),
-        wechat_to_openid=required_env("WECHAT_TO_OPENID"),
-        wechat_template_id=required_env("WECHAT_TEMPLATE_ID"),
-        xueqiu_cookie=os.getenv("XUEQIU_COOKIE", "").strip(),
-    )
+def split_urls(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[\n,;]+", value) if part.strip()]
+
+
+def load_configs() -> list[Config]:
+    urls = split_urls(os.getenv("XUEQIU_URLS", ""))
+    if not urls:
+        urls = [required_env("XUEQIU_URL")]
+    urls.extend(split_urls(os.getenv("EXTRA_XUEQIU_URLS", "")))
+    urls = list(dict.fromkeys(urls))
+
+    common = {
+        "wechat_app_id": required_env("WECHAT_APP_ID"),
+        "wechat_app_secret": required_env("WECHAT_APP_SECRET"),
+        "wechat_to_openid": required_env("WECHAT_TO_OPENID"),
+        "wechat_template_id": required_env("WECHAT_TEMPLATE_ID"),
+        "xueqiu_cookie": os.getenv("XUEQIU_COOKIE", "").strip(),
+    }
+    return [Config(xueqiu_url=url, **common) for url in urls]
 
 
 def now_text() -> str:
@@ -264,6 +274,19 @@ def fetch_holdings(config: Config) -> dict[str, float]:
     return holdings
 
 
+def fetch_cube_name(config: Config) -> str:
+    params = urllib.parse.urlencode({"symbol": config.cube_symbol})
+    try:
+        data = request_json(f"{XUEQIU_SHOW_API}?{params}", cookie=config.xueqiu_cookie)
+        if isinstance(data, dict):
+            name = data.get("name")
+            if name:
+                return str(name)
+    except MonitorError as exc:
+        print(f"[{now_text()}] Xueqiu cube name fetch failed for {config.cube_symbol}: {exc}", file=sys.stderr)
+    return config.cube_symbol
+
+
 def find_holding_items(data: dict[str, Any]) -> list[dict[str, Any]] | None:
     view_rebalancing = data.get("view_rebalancing")
     if isinstance(view_rebalancing, dict):
@@ -302,13 +325,13 @@ def extract_cube_info_from_html(html: str) -> dict[str, Any]:
     return data
 
 
-def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[str, float]]:
+def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[str, float], str]:
     last_error: MonitorError | None = None
     for attempt in range(2):
         try:
             if attempt:
                 prime_xueqiu_session(config)
-            return fetch_rebalance_records(config), fetch_holdings(config)
+            return fetch_rebalance_records(config), fetch_holdings(config), fetch_cube_name(config)
         except MonitorError as exc:
             last_error = exc
             if attempt == 0:
@@ -334,8 +357,44 @@ def load_history() -> dict[str, Any]:
         return json.load(f)
 
 
+def empty_cube_history() -> dict[str, Any]:
+    return {"notified_rebalance_ids": [], "holdings": {}, "updated_at": None, "name": None}
+
+
+def migrate_legacy_history(history: dict[str, Any], primary_symbol: str) -> dict[str, Any]:
+    if "cubes" in history:
+        return history
+    if "holdings" not in history and "notified_rebalance_ids" not in history:
+        history["cubes"] = {}
+        return history
+    history["cubes"] = {
+        primary_symbol: {
+            "holdings": history.get("holdings", {}),
+            "notified_rebalance_ids": history.get("notified_rebalance_ids", []),
+            "updated_at": history.get("updated_at"),
+            "name": history.get("name"),
+        }
+    }
+    history.pop("holdings", None)
+    history.pop("notified_rebalance_ids", None)
+    return history
+
+
+def get_cube_history(history: dict[str, Any], symbol: str) -> dict[str, Any]:
+    cubes = history.setdefault("cubes", {})
+    cube_history = cubes.setdefault(symbol, empty_cube_history())
+    cube_history.setdefault("holdings", {})
+    cube_history.setdefault("notified_rebalance_ids", [])
+    return cube_history
+
+
 def save_history(history: dict[str, Any]) -> None:
-    history["notified_rebalance_ids"] = list(dict.fromkeys(history.get("notified_rebalance_ids", [])))[-MAX_NOTIFIED_REBALANCE_IDS:]
+    if isinstance(history.get("cubes"), dict):
+        for cube_history in history["cubes"].values():
+            if isinstance(cube_history, dict):
+                cube_history["notified_rebalance_ids"] = list(dict.fromkeys(cube_history.get("notified_rebalance_ids", [])))[-MAX_NOTIFIED_REBALANCE_IDS:]
+    else:
+        history["notified_rebalance_ids"] = list(dict.fromkeys(history.get("notified_rebalance_ids", [])))[-MAX_NOTIFIED_REBALANCE_IDS:]
     history["updated_at"] = now_text()
     tmp = HISTORY_FILE.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
@@ -449,7 +508,11 @@ def fetch_wechat_access_token(config: Config) -> str:
     return str(token)
 
 
-def push_wechat(config: Config, changes: list[dict[str, str]]) -> None:
+def add_cube_name_to_changes(changes: list[dict[str, Any]], cube_name: str) -> list[dict[str, Any]]:
+    return [{**change, "stock": f"{cube_name} - {change['stock']}"} for change in changes]
+
+
+def push_wechat(config: Config, changes: list[dict[str, Any]]) -> None:
     token = fetch_wechat_access_token(config)
     for change in changes:
         body = {
@@ -468,18 +531,14 @@ def push_wechat(config: Config, changes: list[dict[str, str]]) -> None:
         print(f"[{now_text()}] 微信测试号推送结果：{result}")
 
 
-def main() -> int:
-    if not in_trading_window():
-        print(f"[{now_text()}] 非交易监控时段，跳过")
-        return 0
-
-    config = load_config()
-    history = load_history()
+def monitor_config(config: Config, history: dict[str, Any]) -> int:
+    cube_history = get_cube_history(history, config.cube_symbol)
     random_delay()
     prime_xueqiu_session(config)
 
-    records, current_holdings = fetch_xueqiu_snapshot(config)
-    notified_ids = set(history.get("notified_rebalance_ids", []))
+    records, current_holdings, cube_name = fetch_xueqiu_snapshot(config)
+    cube_history["name"] = cube_name
+    notified_ids = set(cube_history.get("notified_rebalance_ids", []))
 
     direct_changes: list[dict[str, Any]] = []
     pending_records: list[tuple[str, list[dict[str, Any]]]] = []
@@ -494,7 +553,7 @@ def main() -> int:
             pending_records.append((rid, changes))
             new_record_ids.append(rid)
 
-    if not history.get("holdings") and not notified_ids:
+    if not cube_history.get("holdings") and not notified_ids:
         if not current_holdings and not pending_records:
             print(f"[{now_text()}] Empty holdings on initial run; skip baseline and notification.")
             return 0
@@ -502,19 +561,19 @@ def main() -> int:
             latest_record_id, latest_changes = pending_records[0]
             latest_changes = filter_significant_changes(latest_changes)
             if not latest_changes:
-                history["holdings"] = current_holdings
-                history["notified_rebalance_ids"] = [latest_record_id]
+                cube_history["holdings"] = current_holdings
+                cube_history["notified_rebalance_ids"] = [latest_record_id]
                 save_history(history)
                 print(f"[{now_text()}] Initial rebalance below weight threshold; baseline saved without notification.")
                 return 0
-            push_wechat(config, latest_changes)
-            history["holdings"] = current_holdings
-            history["notified_rebalance_ids"] = [latest_record_id]
+            push_wechat(config, add_cube_name_to_changes(latest_changes, cube_name))
+            cube_history["holdings"] = current_holdings
+            cube_history["notified_rebalance_ids"] = [latest_record_id]
             save_history(history)
             print(f"[{now_text()}] 首次运行，已推送最新调仓并建立基线")
             return 0
-        history["holdings"] = current_holdings
-        history["notified_rebalance_ids"] = list(dict.fromkeys(new_record_ids or [record_id(r, i) for i, r in enumerate(records[:1])]))[-MAX_NOTIFIED_REBALANCE_IDS:]
+        cube_history["holdings"] = current_holdings
+        cube_history["notified_rebalance_ids"] = list(dict.fromkeys(new_record_ids or [record_id(r, i) for i, r in enumerate(records[:1])]))[-MAX_NOTIFIED_REBALANCE_IDS:]
         save_history(history)
         print(f"[{now_text()}] 首次运行，已建立基线，不推送")
         return 0
@@ -523,20 +582,41 @@ def main() -> int:
         print(f"[{now_text()}] Empty holdings without direct rebalance changes; skip notification and history update.")
         return 0
 
-    changes = filter_significant_changes(direct_changes or compare_holdings(history.get("holdings", {}), current_holdings))
+    changes = filter_significant_changes(direct_changes or compare_holdings(cube_history.get("holdings", {}), current_holdings))
     if changes:
-        push_wechat(config, changes)
+        push_wechat(config, add_cube_name_to_changes(changes, cube_name))
         if current_holdings:
-            history["holdings"] = current_holdings
-        history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
+            cube_history["holdings"] = current_holdings
+        cube_history["notified_rebalance_ids"] = list(dict.fromkeys((cube_history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
         save_history(history)
     else:
         if current_holdings or new_record_ids:
             if current_holdings:
-                history["holdings"] = current_holdings
-            history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
+                cube_history["holdings"] = current_holdings
+            cube_history["notified_rebalance_ids"] = list(dict.fromkeys((cube_history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
             save_history(history)
         print(f"[{now_text()}] 未发现调仓")
+    return 0
+
+
+def main() -> int:
+    if not in_trading_window():
+        print(f"[{now_text()}] 非交易监控时段，跳过")
+        return 0
+
+    configs = load_configs()
+    history = migrate_legacy_history(load_history(), configs[0].cube_symbol)
+    failures: list[str] = []
+
+    for config in configs:
+        try:
+            monitor_config(config, history)
+        except MonitorError as exc:
+            failures.append(f"{config.cube_symbol}: {exc}")
+            print(f"[{now_text()}] {config.cube_symbol} monitor failed: {exc}", file=sys.stderr)
+
+    if failures:
+        raise MonitorError("; ".join(failures))
     return 0
 
 

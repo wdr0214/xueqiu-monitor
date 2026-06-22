@@ -25,6 +25,7 @@ jobs:
       HISTORY_FILE: history.json
       SEND_INITIAL_REBALANCE: "true"
       XUEQIU_URL: ${{ secrets.XUEQIU_URL }}
+      EXTRA_XUEQIU_URLS: https://xueqiu.com/p/ZH3388446
       XUEQIU_COOKIE: ${{ secrets.XUEQIU_COOKIE }}
       WECHAT_APP_ID: ${{ secrets.WECHAT_APP_ID }}
       WECHAT_APP_SECRET: ${{ secrets.WECHAT_APP_SECRET }}
