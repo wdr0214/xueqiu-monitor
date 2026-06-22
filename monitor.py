@@ -40,6 +40,7 @@ POLL_END = os.getenv("POLL_END", "15:30")
 SEND_INITIAL_REBALANCE = os.getenv("SEND_INITIAL_REBALANCE", "false").strip().lower() in {"1", "true", "yes", "y"}
 XUEQIU_RETRY_SECONDS = int(os.getenv("XUEQIU_RETRY_SECONDS", "120"))
 MAX_NOTIFIED_REBALANCE_IDS = int(os.getenv("MAX_NOTIFIED_REBALANCE_IDS", "30"))
+MIN_NOTIFY_WEIGHT_CHANGE = float(os.getenv("MIN_NOTIFY_WEIGHT_CHANGE", "1"))
 
 
 class MonitorError(Exception):
@@ -351,7 +352,7 @@ def record_id(record: dict[str, Any], index: int) -> str:
     return f"record-{index}-{json.dumps(record, ensure_ascii=False, sort_keys=True)[:80]}"
 
 
-def normalize_change(item: dict[str, Any]) -> dict[str, str]:
+def normalize_change(item: dict[str, Any]) -> dict[str, Any]:
     name = pick(item, "stock_name", "stockName", "name", "stock_symbol", "symbol") or "未知股票"
     symbol = pick(item, "stock_symbol", "stockSymbol", "symbol")
     prev_weight = pick(item, "prev_weight", "prevWeight", "prev_target_weight", "prevTargetWeight")
@@ -359,7 +360,24 @@ def normalize_change(item: dict[str, Any]) -> dict[str, str]:
     price = pick(item, "price", "rebalanced_price", "rebalancedPrice", "trade_price", "tradePrice") or "未披露"
     action = pick(item, "action", "action_name", "actionName") or describe_weight_change(prev_weight, target_weight)
     stock = f"{name}({symbol})" if symbol and str(symbol) not in str(name) else str(name)
-    return {"action": str(action), "stock": stock, "price": str(price)}
+    return {"action": str(action), "stock": stock, "price": str(price), "weight_delta": weight_delta(prev_weight, target_weight)}
+
+
+def parse_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def weight_delta(prev: Any, target: Any) -> float | None:
+    previous = parse_float(prev)
+    current = parse_float(target)
+    if previous is None or current is None:
+        return None
+    return abs(current - previous)
 
 
 def describe_weight_change(prev: Any, target: Any) -> str:
@@ -379,17 +397,18 @@ def describe_weight_change(prev: Any, target: Any) -> str:
     return f"持仓 {previous:g}% -> {current:g}%"
 
 
-def extract_changes_from_record(record: dict[str, Any]) -> list[dict[str, str]]:
+def extract_changes_from_record(record: dict[str, Any]) -> list[dict[str, Any]]:
     items = record.get("rebalancing_histories") or record.get("histories") or record.get("stocks") or [record]
     return [normalize_change(item) for item in items if isinstance(item, dict)]
 
 
-def compare_holdings(old: dict[str, float], new: dict[str, float]) -> list[dict[str, str]]:
-    changes: list[dict[str, str]] = []
+def compare_holdings(old: dict[str, float], new: dict[str, float]) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
     for stock in sorted(set(old) | set(new)):
         before = old.get(stock, 0)
         after = new.get(stock, 0)
-        if round(before, 4) == round(after, 4):
+        delta = abs(after - before)
+        if round(delta, 4) == 0:
             continue
         if before == 0:
             action = f"买入 0% -> {after:g}%"
@@ -399,8 +418,22 @@ def compare_holdings(old: dict[str, float], new: dict[str, float]) -> list[dict[
             action = f"增持 {before:g}% -> {after:g}%"
         else:
             action = f"减持 {before:g}% -> {after:g}%"
-        changes.append({"action": action, "stock": stock, "price": "未披露"})
+        changes.append({"action": action, "stock": stock, "price": "未披露", "weight_delta": delta})
     return changes
+
+
+def filter_significant_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    significant: list[dict[str, Any]] = []
+    skipped = 0
+    for change in changes:
+        delta = change.get("weight_delta")
+        if delta is not None and abs(float(delta)) < MIN_NOTIFY_WEIGHT_CHANGE:
+            skipped += 1
+            continue
+        significant.append(change)
+    if skipped:
+        print(f"[{now_text()}] Skipped {skipped} change(s) below {MIN_NOTIFY_WEIGHT_CHANGE:g}% weight threshold.")
+    return significant
 
 
 def fetch_wechat_access_token(config: Config) -> str:
@@ -448,8 +481,8 @@ def main() -> int:
     records, current_holdings = fetch_xueqiu_snapshot(config)
     notified_ids = set(history.get("notified_rebalance_ids", []))
 
-    direct_changes: list[dict[str, str]] = []
-    pending_records: list[tuple[str, list[dict[str, str]]]] = []
+    direct_changes: list[dict[str, Any]] = []
+    pending_records: list[tuple[str, list[dict[str, Any]]]] = []
     new_record_ids: list[str] = []
     for index, record in enumerate(records):
         rid = record_id(record, index)
@@ -467,6 +500,13 @@ def main() -> int:
             return 0
         if SEND_INITIAL_REBALANCE and pending_records:
             latest_record_id, latest_changes = pending_records[0]
+            latest_changes = filter_significant_changes(latest_changes)
+            if not latest_changes:
+                history["holdings"] = current_holdings
+                history["notified_rebalance_ids"] = [latest_record_id]
+                save_history(history)
+                print(f"[{now_text()}] Initial rebalance below weight threshold; baseline saved without notification.")
+                return 0
             push_wechat(config, latest_changes)
             history["holdings"] = current_holdings
             history["notified_rebalance_ids"] = [latest_record_id]
@@ -483,7 +523,7 @@ def main() -> int:
         print(f"[{now_text()}] Empty holdings without direct rebalance changes; skip notification and history update.")
         return 0
 
-    changes = direct_changes or compare_holdings(history.get("holdings", {}), current_holdings)
+    changes = filter_significant_changes(direct_changes or compare_holdings(history.get("holdings", {}), current_holdings))
     if changes:
         push_wechat(config, changes)
         if current_holdings:
@@ -491,6 +531,11 @@ def main() -> int:
         history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
         save_history(history)
     else:
+        if current_holdings or new_record_ids:
+            if current_holdings:
+                history["holdings"] = current_holdings
+            history["notified_rebalance_ids"] = list(dict.fromkeys((history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
+            save_history(history)
         print(f"[{now_text()}] 未发现调仓")
     return 0
 
