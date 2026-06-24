@@ -30,6 +30,7 @@ jobs:
       WECHAT_APP_ID: ${{ secrets.WECHAT_APP_ID }}
       WECHAT_APP_SECRET: ${{ secrets.WECHAT_APP_SECRET }}
       WECHAT_TO_OPENID: ${{ secrets.WECHAT_TO_OPENID }}
+      WECHAT_TO_OPENIDS: ${{ secrets.WECHAT_TO_OPENIDS }}
       WECHAT_TEMPLATE_ID: ${{ secrets.WECHAT_TEMPLATE_ID }}
 
     steps:

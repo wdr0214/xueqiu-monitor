@@ -65,7 +65,7 @@ class Config:
     xueqiu_url: str
     wechat_app_id: str
     wechat_app_secret: str
-    wechat_to_openid: str
+    wechat_to_openids: tuple[str, ...]
     wechat_template_id: str
     xueqiu_cookie: str = ""
 
@@ -93,6 +93,16 @@ def split_urls(value: str) -> list[str]:
     return [part.strip() for part in re.split(r"[\n,;]+", value) if part.strip()]
 
 
+def load_wechat_openids() -> tuple[str, ...]:
+    value = os.getenv("WECHAT_TO_OPENIDS", "").strip()
+    if not value:
+        value = required_env("WECHAT_TO_OPENID")
+    openids = tuple(dict.fromkeys(split_urls(value)))
+    if not openids:
+        raise MonitorError("缺少微信接收人 openid")
+    return openids
+
+
 def load_configs() -> list[Config]:
     urls = split_urls(os.getenv("XUEQIU_URLS", ""))
     if not urls:
@@ -103,7 +113,7 @@ def load_configs() -> list[Config]:
     common = {
         "wechat_app_id": required_env("WECHAT_APP_ID"),
         "wechat_app_secret": required_env("WECHAT_APP_SECRET"),
-        "wechat_to_openid": required_env("WECHAT_TO_OPENID"),
+        "wechat_to_openids": load_wechat_openids(),
         "wechat_template_id": required_env("WECHAT_TEMPLATE_ID"),
         "xueqiu_cookie": os.getenv("XUEQIU_COOKIE", "").strip(),
     }
@@ -512,23 +522,40 @@ def add_cube_name_to_changes(changes: list[dict[str, Any]], cube_name: str) -> l
     return [{**change, "stock": f"{cube_name} - {change['stock']}"} for change in changes]
 
 
+def mask_openid(openid: str) -> str:
+    if len(openid) <= 8:
+        return openid
+    return f"{openid[:4]}...{openid[-4:]}"
+
+
 def push_wechat(config: Config, changes: list[dict[str, Any]]) -> None:
     token = fetch_wechat_access_token(config)
-    for change in changes:
-        body = {
-            "touser": config.wechat_to_openid,
-            "template_id": config.wechat_template_id,
-            "data": {
-                "stockName": {"value": change["stock"]},
-                "rebalanceChange": {"value": change["action"]},
-                "rebalancePrice": {"value": change["price"]},
-                "remark": {"value": f"雪球组合调仓监控自动推送｜{now_text()}"},
-            },
-        }
-        result = request_json(f"{WECHAT_TEMPLATE_API}?access_token={token}", method="POST", body=body)
-        if isinstance(result, dict) and result.get("errcode") not in (None, 0):
-            raise MonitorError(f"微信模板消息发送失败：{result}")
-        print(f"[{now_text()}] 微信测试号推送结果：{result}")
+    failures: list[str] = []
+    sent_count = 0
+
+    for openid in config.wechat_to_openids:
+        for change in changes:
+            body = {
+                "touser": openid,
+                "template_id": config.wechat_template_id,
+                "data": {
+                    "stockName": {"value": change["stock"]},
+                    "rebalanceChange": {"value": change["action"]},
+                    "rebalancePrice": {"value": change["price"]},
+                    "remark": {"value": f"雪球组合调仓监控自动推送｜{now_text()}"},
+                },
+            }
+            result = request_json(f"{WECHAT_TEMPLATE_API}?access_token={token}", method="POST", body=body)
+            if isinstance(result, dict) and result.get("errcode") not in (None, 0):
+                failures.append(f"{mask_openid(openid)}: {result}")
+                continue
+            sent_count += 1
+            print(f"[{now_text()}] 微信测试号推送结果（{mask_openid(openid)}）：{result}")
+
+    if failures and sent_count == 0:
+        raise MonitorError(f"微信模板消息发送失败：{'; '.join(failures)}")
+    if failures:
+        print(f"[{now_text()}] Some WeChat recipients failed: {'; '.join(failures)}", file=sys.stderr)
 
 
 def monitor_config(config: Config, history: dict[str, Any]) -> int:
