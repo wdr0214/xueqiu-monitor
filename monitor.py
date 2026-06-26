@@ -39,7 +39,7 @@ POLL_START = os.getenv("POLL_START", "09:00")
 POLL_END = os.getenv("POLL_END", "15:30")
 SEND_INITIAL_REBALANCE = os.getenv("SEND_INITIAL_REBALANCE", "false").strip().lower() in {"1", "true", "yes", "y"}
 XUEQIU_RETRY_SECONDS = int(os.getenv("XUEQIU_RETRY_SECONDS", "120"))
-MAX_NOTIFIED_REBALANCE_IDS = int(os.getenv("MAX_NOTIFIED_REBALANCE_IDS", "30"))
+MAX_NOTIFIED_REBALANCE_IDS = int(os.getenv("MAX_NOTIFIED_REBALANCE_IDS", "100"))
 MIN_NOTIFY_WEIGHT_CHANGE = float(os.getenv("MIN_NOTIFY_WEIGHT_CHANGE", "1"))
 
 
@@ -422,6 +422,38 @@ def record_id(record: dict[str, Any], index: int) -> str:
     return f"record-{index}-{json.dumps(record, ensure_ascii=False, sort_keys=True)[:80]}"
 
 
+def record_sort_key(record: dict[str, Any], rid: str) -> tuple[int, int]:
+    timestamp = 0
+    for key in ("created_at", "updated_at", "created"):
+        value = record.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            timestamp = int(float(value))
+            break
+        except (TypeError, ValueError):
+            continue
+    try:
+        numeric_id = int(rid)
+    except ValueError:
+        numeric_id = 0
+    return timestamp, numeric_id
+
+
+def load_last_rebalance_key(cube_history: dict[str, Any]) -> tuple[int, int]:
+    raw = cube_history.get("last_rebalance_key")
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        try:
+            return int(raw[0]), int(raw[1])
+        except (TypeError, ValueError):
+            return 0, 0
+    return 0, 0
+
+
+def store_last_rebalance_key(cube_history: dict[str, Any], key: tuple[int, int]) -> None:
+    cube_history["last_rebalance_key"] = [int(key[0]), int(key[1])]
+
+
 def normalize_change(item: dict[str, Any]) -> dict[str, Any]:
     name = pick(item, "stock_name", "stockName", "name", "stock_symbol", "symbol") or "未知股票"
     symbol = pick(item, "stock_symbol", "stockSymbol", "symbol")
@@ -565,43 +597,56 @@ def monitor_config(config: Config, history: dict[str, Any]) -> int:
     prime_xueqiu_session(config)
 
     records, current_holdings, cube_name = fetch_xueqiu_snapshot(config)
+    name_changed = cube_history.get("name") != cube_name
     cube_history["name"] = cube_name
     notified_ids = set(cube_history.get("notified_rebalance_ids", []))
+    stored_rebalance_key = load_last_rebalance_key(cube_history)
+    last_rebalance_key = stored_rebalance_key
 
     direct_changes: list[dict[str, Any]] = []
-    pending_records: list[tuple[str, list[dict[str, Any]]]] = []
+    pending_records: list[tuple[str, tuple[int, int], list[dict[str, Any]]]] = []
     new_record_ids: list[str] = []
+    new_record_keys: list[tuple[int, int]] = []
     for index, record in enumerate(records):
         rid = record_id(record, index)
+        key = record_sort_key(record, rid)
         if rid in notified_ids:
+            last_rebalance_key = max(last_rebalance_key, key)
+            continue
+        if key <= last_rebalance_key:
             continue
         changes = extract_changes_from_record(record)
         if changes:
             direct_changes.extend(changes)
-            pending_records.append((rid, changes))
+            pending_records.append((rid, key, changes))
             new_record_ids.append(rid)
+            new_record_keys.append(key)
 
     if not cube_history.get("holdings") and not notified_ids:
         if not current_holdings and not pending_records:
             print(f"[{now_text()}] Empty holdings on initial run; skip baseline and notification.")
             return 0
         if SEND_INITIAL_REBALANCE and pending_records:
-            latest_record_id, latest_changes = pending_records[0]
+            latest_record_id, latest_record_key, latest_changes = pending_records[0]
             latest_changes = filter_significant_changes(latest_changes)
             if not latest_changes:
                 cube_history["holdings"] = current_holdings
                 cube_history["notified_rebalance_ids"] = [latest_record_id]
+                store_last_rebalance_key(cube_history, latest_record_key)
                 save_history(history)
                 print(f"[{now_text()}] Initial rebalance below weight threshold; baseline saved without notification.")
                 return 0
             push_wechat(config, add_cube_name_to_changes(latest_changes, cube_name))
             cube_history["holdings"] = current_holdings
             cube_history["notified_rebalance_ids"] = [latest_record_id]
+            store_last_rebalance_key(cube_history, latest_record_key)
             save_history(history)
             print(f"[{now_text()}] 首次运行，已推送最新调仓并建立基线")
             return 0
         cube_history["holdings"] = current_holdings
         cube_history["notified_rebalance_ids"] = list(dict.fromkeys(new_record_ids or [record_id(r, i) for i, r in enumerate(records[:1])]))[-MAX_NOTIFIED_REBALANCE_IDS:]
+        if records:
+            store_last_rebalance_key(cube_history, max(record_sort_key(record, record_id(record, index)) for index, record in enumerate(records)))
         save_history(history)
         print(f"[{now_text()}] 首次运行，已建立基线，不推送")
         return 0
@@ -616,12 +661,20 @@ def monitor_config(config: Config, history: dict[str, Any]) -> int:
         if current_holdings:
             cube_history["holdings"] = current_holdings
         cube_history["notified_rebalance_ids"] = list(dict.fromkeys((cube_history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
+        if new_record_keys:
+            store_last_rebalance_key(cube_history, max([last_rebalance_key] + new_record_keys))
         save_history(history)
     else:
-        if current_holdings or new_record_ids:
+        holdings_changed = bool(current_holdings) and current_holdings != cube_history.get("holdings", {})
+        rebalance_key_changed = last_rebalance_key != stored_rebalance_key
+        if holdings_changed or new_record_ids or name_changed or rebalance_key_changed:
             if current_holdings:
                 cube_history["holdings"] = current_holdings
             cube_history["notified_rebalance_ids"] = list(dict.fromkeys((cube_history.get("notified_rebalance_ids", []) + new_record_ids)))[-MAX_NOTIFIED_REBALANCE_IDS:]
+            if new_record_keys:
+                store_last_rebalance_key(cube_history, max([last_rebalance_key] + new_record_keys))
+            else:
+                store_last_rebalance_key(cube_history, last_rebalance_key)
             save_history(history)
         print(f"[{now_text()}] 未发现调仓")
     return 0
