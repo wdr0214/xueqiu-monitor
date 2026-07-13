@@ -266,11 +266,14 @@ def fetch_holdings(config: Config) -> dict[str, float]:
         raise MonitorError("Xueqiu holdings response is not an object")
     items = find_holding_items(data)
     if items is None:
-        html = request_text(f"{XUEQIU_ANALYZE_PAGE}?{params}", cookie=config.xueqiu_cookie)
-        items = find_holding_items(extract_cube_info_from_html(html))
+        items = find_holding_items(fetch_analyze_cube_info(config))
     if not isinstance(items, list):
         raise MonitorError("Xueqiu holdings list is missing or invalid")
 
+    return holdings_from_items(items)
+
+
+def holdings_from_items(items: list[dict[str, Any]]) -> dict[str, float]:
     holdings: dict[str, float] = {}
 
     for item in items:
@@ -283,6 +286,18 @@ def fetch_holdings(config: Config) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return holdings
+
+
+def fetch_analyze_cube_info(config: Config) -> dict[str, Any]:
+    params = urllib.parse.urlencode({"symbol": config.cube_symbol})
+    url = f"{XUEQIU_ANALYZE_PAGE}?{params}"
+    try:
+        html = request_text(url, cookie=config.xueqiu_cookie)
+    except MonitorError:
+        if not config.xueqiu_cookie:
+            raise
+        html = request_text(url)
+    return extract_cube_info_from_html(html)
 
 
 def fetch_cube_name(config: Config) -> str:
@@ -324,9 +339,10 @@ def extract_cube_info_from_html(html: str) -> dict[str, Any]:
     if start < 0:
         raise MonitorError("Xueqiu analyze page missing SNB.cubeInfo")
     start += len(marker)
-    end = html.find(";</script>", start)
-    if end < 0:
-        raise MonitorError("Xueqiu analyze page cubeInfo terminator missing")
+    start = html.find("{", start)
+    if start < 0:
+        raise MonitorError("Xueqiu analyze page cubeInfo object missing")
+    end = find_json_object_end(html, start)
     try:
         data = json.loads(html[start:end])
     except json.JSONDecodeError as exc:
@@ -334,6 +350,49 @@ def extract_cube_info_from_html(html: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise MonitorError("Xueqiu analyze page cubeInfo is not an object")
     return data
+
+
+def find_json_object_end(text: str, start: int) -> int:
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    raise MonitorError("Xueqiu analyze page cubeInfo terminator missing")
+
+
+def fetch_analyze_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[str, float], str]:
+    data = fetch_analyze_cube_info(config)
+    items = find_holding_items(data)
+    if not isinstance(items, list):
+        raise MonitorError("Xueqiu analyze page holdings list is missing or invalid")
+    holdings = holdings_from_items(items)
+    records = []
+    for key in ("view_rebalancing", "last_success_rebalancing", "last_rebalancing"):
+        record = data.get(key)
+        if isinstance(record, dict) and record.get("id") not in (None, ""):
+            records.append(record)
+            break
+    name = str(data.get("name") or config.cube_symbol)
+    if not records:
+        raise MonitorError("Xueqiu analyze page rebalancing record is missing")
+    return records, holdings, name
 
 
 def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[str, float], str]:
@@ -345,8 +404,14 @@ def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[st
             return fetch_rebalance_records(config), fetch_holdings(config), fetch_cube_name(config)
         except MonitorError as exc:
             last_error = exc
+            try:
+                snapshot = fetch_analyze_snapshot(config)
+                print(f"[{now_text()}] Xueqiu primary API failed; using analyze-page fallback: {exc}", file=sys.stderr)
+                return snapshot
+            except MonitorError as fallback_exc:
+                last_error = MonitorError(f"{exc}; analyze fallback failed: {fallback_exc}")
             if attempt == 0:
-                print(f"[{now_text()}] Xueqiu fetch failed: {exc}. Retry in {XUEQIU_RETRY_SECONDS}s.", file=sys.stderr)
+                print(f"[{now_text()}] Xueqiu fetch failed: {last_error}. Retry in {XUEQIU_RETRY_SECONDS}s.", file=sys.stderr)
                 time.sleep(XUEQIU_RETRY_SECONDS)
                 continue
             break
@@ -501,7 +566,14 @@ def describe_weight_change(prev: Any, target: Any) -> str:
 
 def extract_changes_from_record(record: dict[str, Any]) -> list[dict[str, Any]]:
     items = record.get("rebalancing_histories") or record.get("histories") or record.get("stocks") or [record]
-    return [normalize_change(item) for item in items if isinstance(item, dict)]
+    changes = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if pick(item, "stock_name", "stockName", "name", "stock_symbol", "symbol") is None:
+            continue
+        changes.append(normalize_change(item))
+    return changes
 
 
 def compare_holdings(old: dict[str, float], new: dict[str, float]) -> list[dict[str, Any]]:
@@ -618,6 +690,7 @@ def monitor_config(config: Config, history: dict[str, Any]) -> int:
         changes = extract_changes_from_record(record)
         if changes:
             direct_changes.extend(changes)
+        if changes or key > last_rebalance_key:
             pending_records.append((rid, key, changes))
             new_record_ids.append(rid)
             new_record_keys.append(key)
