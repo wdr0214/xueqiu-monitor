@@ -1,0 +1,34 @@
+name: Price diagnosis no push
+on:
+  push:
+    paths: [".github/workflows/price-diagnosis.yml"]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      XUEQIU_COOKIE: ${{ secrets.XUEQIU_COOKIE }}
+      XUEQIU_URL: ${{ secrets.XUEQIU_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: |
+          python - <<'PY'
+          import os, json
+          import monitor as m
+          for url in [os.environ["XUEQIU_URL"], "https://xueqiu.com/p/ZH3388446"]:
+              c=m.Config(url,"","",(),"",os.environ["XUEQIU_COOKIE"])
+              try:
+                  records=m.fetch_rebalance_records(c)
+                  print("PRIMARY",c.cube_symbol,len(records))
+                  for r in records[:3]:
+                      print("RECORD",r.get("id"),json.dumps(m.extract_changes_from_record(r),ensure_ascii=False))
+                  print("HOLDINGS",len(m.fetch_holdings(c)))
+              except Exception as e:
+                  print("ERROR",c.cube_symbol,str(e))
+          PY
