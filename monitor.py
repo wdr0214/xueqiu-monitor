@@ -397,24 +397,27 @@ def fetch_analyze_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[s
 
 def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[str, float], str]:
     last_error: MonitorError | None = None
+    records = None
     for attempt in range(2):
         try:
             if attempt:
                 prime_xueqiu_session(config)
-            return fetch_rebalance_records(config), fetch_holdings(config), fetch_cube_name(config)
+            records = fetch_rebalance_records(config)
+            return records, fetch_holdings(config), fetch_cube_name(config)
         except MonitorError as exc:
             last_error = exc
-            try:
-                snapshot = fetch_analyze_snapshot(config)
-                print(f"[{now_text()}] Xueqiu primary API failed; using analyze-page fallback: {exc}", file=sys.stderr)
-                return snapshot
-            except MonitorError as fallback_exc:
-                last_error = MonitorError(f"{exc}; analyze fallback failed: {fallback_exc}")
             if attempt == 0:
                 print(f"[{now_text()}] Xueqiu fetch failed: {last_error}. Retry in {XUEQIU_RETRY_SECONDS}s.", file=sys.stderr)
                 time.sleep(XUEQIU_RETRY_SECONDS)
                 continue
             break
+    try:
+        fallback_records, holdings, name = fetch_analyze_snapshot(config)
+        print(f"[{now_text()}] Xueqiu primary API failed after retry; using analyze-page fallback: {last_error}", file=sys.stderr)
+        # A holdings failure must not discard successfully fetched execution prices.
+        return records if records is not None else fallback_records, holdings, name
+    except MonitorError as fallback_exc:
+        last_error = MonitorError(f"{last_error}; analyze fallback failed: {fallback_exc}")
     raise MonitorError(f"Xueqiu fetch failed after retry; no notification sent: {last_error}")
 
 
