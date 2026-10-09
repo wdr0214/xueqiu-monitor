@@ -47,6 +47,27 @@ class MonitorError(Exception):
     pass
 
 
+class XueqiuLoginError(MonitorError):
+    pass
+
+
+def is_xueqiu_login_error(url: str, data: Any) -> bool:
+    return (
+        urllib.parse.urlparse(url).hostname == "xueqiu.com"
+        and isinstance(data, dict)
+        and str(data.get("error_code")) == "400016"
+    )
+
+
+def raise_json_http_error(url: str, status: int, raw: str) -> None:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+    error_type = XueqiuLoginError if is_xueqiu_login_error(url, data) else MonitorError
+    raise error_type(f"网络请求失败 HTTP {status}: {raw[:300]}")
+
+
 def load_timezone(name: str):
     try:
         return ZoneInfo(name)
@@ -194,7 +215,7 @@ def request_json(url: str, *, method: str = "GET", body: dict[str, Any] | None =
             )
             raw = response.text
             if response.status_code >= 400:
-                raise MonitorError(f"网络请求失败 HTTP {response.status_code}: {raw[:300]}")
+                raise_json_http_error(url, response.status_code, raw)
         except MonitorError:
             raise
         except Exception as exc:
@@ -210,7 +231,7 @@ def request_json(url: str, *, method: str = "GET", body: dict[str, Any] | None =
                 raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise MonitorError(f"网络请求失败 HTTP {exc.code}: {detail[:300]}") from exc
+            raise_json_http_error(url, exc.code, detail)
         except urllib.error.URLError as exc:
             raise MonitorError(f"网络请求异常：{exc.reason}") from exc
 
@@ -220,7 +241,8 @@ def request_json(url: str, *, method: str = "GET", body: dict[str, Any] | None =
         raise MonitorError(f"返回内容不是 JSON：{raw[:300]}") from exc
 
     if isinstance(data, dict) and data.get("error_code"):
-        raise MonitorError(f"接口返回错误：{data}")
+        error_type = XueqiuLoginError if is_xueqiu_login_error(url, data) else MonitorError
+        raise error_type(f"接口返回错误：{data}")
     return data
 
 
@@ -406,6 +428,9 @@ def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[st
             return records, fetch_holdings(config), fetch_cube_name(config)
         except MonitorError as exc:
             last_error = exc
+            if isinstance(exc, XueqiuLoginError):
+                print(f"[{now_text()}] Xueqiu login state rejected; skip retry delay and use analyze-page fallback.", file=sys.stderr)
+                break
             if attempt == 0:
                 print(f"[{now_text()}] Xueqiu fetch failed: {last_error}. Retry in {XUEQIU_RETRY_SECONDS}s.", file=sys.stderr)
                 time.sleep(XUEQIU_RETRY_SECONDS)
@@ -413,7 +438,8 @@ def fetch_xueqiu_snapshot(config: Config) -> tuple[list[dict[str, Any]], dict[st
             break
     try:
         fallback_records, holdings, name = fetch_analyze_snapshot(config)
-        print(f"[{now_text()}] Xueqiu primary API failed after retry; using analyze-page fallback: {last_error}", file=sys.stderr)
+        retry_note = "without retry" if isinstance(last_error, XueqiuLoginError) else "after retry"
+        print(f"[{now_text()}] Xueqiu primary API failed {retry_note}; using analyze-page fallback: {last_error}", file=sys.stderr)
         # A holdings failure must not discard successfully fetched execution prices.
         return records if records is not None else fallback_records, holdings, name
     except MonitorError as fallback_exc:
